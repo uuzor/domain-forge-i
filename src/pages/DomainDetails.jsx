@@ -1,8 +1,11 @@
 import { useState, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
 import { ArrowLeft, MessageCircle, Share2, Heart, TrendingUp, Clock, Globe, Shield, Users, Zap } from 'lucide-react'
-import { trackDomainView, trackDomainOffer, trackMessageSent } from '../components/Analytics'
+import { trackDomainView, trackDomainOffer, trackMessageSent, trackWalletConnect } from '../components/Analytics'
 import SEOHead, { DomainSEO } from '../components/SEOHead'
+import { useXMTP } from '../lib/xmtp/client.js'
+import { useDoma } from '../lib/doma/client.js'
+import { getBrowserSigner, detectWalletType } from '../lib/web3.js'
 
 export default function DomainDetails() {
   const { domainName } = useParams()
@@ -13,6 +16,9 @@ export default function DomainDetails() {
   const [message, setMessage] = useState('')
   const [offerAmount, setOfferAmount] = useState('')
   const [isWatchlisted, setIsWatchlisted] = useState(false)
+
+  const { initialize, isInitialized, startConversation } = useXMTP()
+  const doma = useDoma('testnet')
 
   useEffect(() => {
     fetchDomainDetails()
@@ -37,49 +43,76 @@ export default function DomainDetails() {
 
   const handleSendMessage = async () => {
     try {
-      const response = await fetch('/api/xmtp/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          conversation_id: 'new',
-          sender: '0x1234...5678',
-          content: message,
-          domain_context: domainName
-        })
+      // Ensure wallet + XMTP
+      const signer = await getBrowserSigner()
+      if (!isInitialized) {
+        const res = await initialize(signer)
+        if (!res.success) {
+          alert('Failed to initialize XMTP. See console for details.')
+          return
+        }
+        trackWalletConnect(detectWalletType())
+      }
+      // Use domain.owner as peer if available
+      const peerAddress = domain?.owner
+      if (!peerAddress) {
+        alert('Owner address not available for messaging.')
+        return
+      }
+
+      const res = await startConversation({
+        peerAddress,
+        domainContext: domainName,
+        initialMessage: message,
       })
 
-      if (response.ok) {
+      if (res.success) {
         trackMessageSent(domainName)
         setShowMessageModal(false)
         setMessage('')
         alert('Message sent successfully!')
+      } else {
+        alert('Failed to start conversation.')
       }
     } catch (error) {
-      console.error('Error sending message:', error)
+      console.error('Error sending message via XMTP:', error)
+      alert(error?.message || 'Failed to send message')
     }
   }
 
   const handleMakeOffer = async () => {
     try {
-      const response = await fetch('/api/doma/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          domain: domainName,
-          type: 'buy',
-          price: parseFloat(offerAmount),
-          quantity: 1
-        })
+      const signer = await getBrowserSigner()
+      const cfg = doma.getConfig()
+      if (!cfg?.contracts?.ownershipToken) {
+        alert('Missing DOMA ownership token contract address. Set VITE_DOMA_OWNERSHIP_TOKEN in your .env.')
+        return
+      }
+      const tokenId = String(domain?.tokenId || domain?.id || '')
+      if (!tokenId) {
+        alert('Missing token ID for this domain.')
+        return
+      }
+
+      const price = String(parseFloat(offerAmount))
+      const res = await doma.createOffer({
+        tokenId,
+        contract: cfg.contracts.ownershipToken,
+        price,
+        signer,
       })
 
-      if (response.ok) {
+      if (res.success) {
         trackDomainOffer(domainName, parseFloat(offerAmount))
         setShowOfferModal(false)
         setOfferAmount('')
         alert('Offer submitted successfully!')
+      } else {
+        alert(`Offer failed: ${res.error || 'unknown_error'}`)
       }
     } catch (error) {
       console.error('Error making offer:', error)
+      alert(error?.message || 'Failed to submit offer')
     }
   }
 

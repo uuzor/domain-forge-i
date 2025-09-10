@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { Search, Plus, Send, Paperclip, Smile, MoreVertical, Phone, Video, Info, Users, Shield, Zap } from 'lucide-react'
-import { trackMessageSent, trackEvent } from '../components/Analytics'
+import { trackMessageSent, trackEvent, trackWalletConnect } from '../components/Analytics'
 import SEOHead from '../components/SEOHead'
+import { useXMTP } from '../lib/xmtp/client.js'
+import { getBrowserSigner, detectWalletType } from '../lib/web3.js'
 
 export default function MessagingCenter() {
   const [conversations, setConversations] = useState([])
@@ -14,78 +16,104 @@ export default function MessagingCenter() {
   const [walletConnected, setWalletConnected] = useState(false)
   const messagesEndRef = useRef(null)
 
+  const {
+    initialize,
+    isInitialized,
+    conversations: xmtpConversations,
+    loadMessages,
+    sendMessage: xmtpSendMessage,
+    getCurrentAddress,
+  } = useXMTP()
+
+  const [myAddress, setMyAddress] = useState(null)
+
   useEffect(() => {
-    fetchConversations()
     checkWalletConnection()
   }, [])
 
   useEffect(() => {
-    if (activeConversation) {
-      fetchMessages(activeConversation.id)
+    // Sync XMTP conversations into local UI state
+    if (isInitialized) {
+      setConversations(xmtpConversations)
+      if (!activeConversation && xmtpConversations.length > 0) {
+        setActiveConversation(xmtpConversations[0])
+      }
+      setLoading(false)
     }
+  }, [isInitialized, xmtpConversations])
+
+  useEffect(() => {
+    const load = async () => {
+      if (activeConversation) {
+        const convMsgs = await loadMessages(activeConversation.id)
+        // Normalize to legacy shape expected by UI
+        setMessages(
+          convMsgs.map((m) => ({
+            id: m.id,
+            sender: m.sender,
+            timestamp: m.timestamp,
+            content: m.content,
+            message_type: m.messageType,
+            offer_details: m.offerDetails,
+          }))
+        )
+      }
+    }
+    load()
   }, [activeConversation])
 
   useEffect(() => {
     scrollToBottom()
   }, [messages])
 
-  const checkWalletConnection = () => {
-    // Mock wallet connection check
-    setWalletConnected(true)
+  const checkWalletConnection = async () => {
+    // Do not auto-connect; wait for user click
+    setWalletConnected(false)
+    setLoading(false)
   }
 
-  const fetchConversations = async () => {
+  const connectWallet = async () => {
     try {
       setLoading(true)
-      const response = await fetch('/api/xmtp/conversations')
-      const data = await response.json()
-      
-      if (data.success) {
-        setConversations(data.data)
-        if (data.data.length > 0) {
-          setActiveConversation(data.data[0])
-        }
+      const signer = await getBrowserSigner()
+      const res = await initialize(signer)
+      if (res.success) {
+        setWalletConnected(true)
+        const addr = await getCurrentAddress()
+        setMyAddress(addr)
+        trackWalletConnect(detectWalletType())
+      } else {
+        alert('Failed to initialize XMTP. See console for details.')
       }
-    } catch (error) {
-      console.error('Error fetching conversations:', error)
+    } catch (e) {
+      console.error(e)
+      alert(e?.message || 'Failed to connect wallet')
     } finally {
       setLoading(false)
     }
   }
 
-  const fetchMessages = async (conversationId) => {
-    try {
-      const response = await fetch(`/api/xmtp/conversations/${conversationId}/messages`)
-      const data = await response.json()
-      
-      if (data.success) {
-        setMessages(data.data)
-      }
-    } catch (error) {
-      console.error('Error fetching messages:', error)
-    }
-  }
-
   const sendMessage = async () => {
     if (!newMessage.trim() || !activeConversation) return
-
     try {
-      const response = await fetch('/api/xmtp/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          conversation_id: activeConversation.id,
-          sender: '0x1234...5678',
-          content: newMessage,
-          domain_context: activeConversation.domain_context
-        })
+      const res = await xmtpSendMessage(activeConversation.id, newMessage, {
+        domainContext: activeConversation.domain_context,
       })
-
-      if (response.ok) {
-        const data = await response.json()
-        setMessages([...messages, data.data])
+      if (res.success) {
         setNewMessage('')
         trackMessageSent(activeConversation.domain_context)
+        // loadMessages will be triggered by stream or can be reloaded explicitly
+        const convMsgs = await loadMessages(activeConversation.id)
+        setMessages(
+          convMsgs.map((m) => ({
+            id: m.id,
+            sender: m.sender,
+            timestamp: m.timestamp,
+            content: m.content,
+            message_type: m.messageType,
+            offer_details: m.offerDetails,
+          }))
+        )
       }
     } catch (error) {
       console.error('Error sending message:', error)
@@ -96,14 +124,18 @@ export default function MessagingCenter() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
 
-  const filteredConversations = conversations.filter(conv =>
-    conv.domain_context.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    conv.participants.some(p => p.toLowerCase().includes(searchQuery.toLowerCase()))
+  const filteredConversations = conversations.filter((conv) =>
+    (conv.domain_context || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (conv.participants || []).some((p) => (p || '').toLowerCase().includes(searchQuery.toLowerCase()))
   )
 
   const formatTime = (timestamp) => {
-    if (timestamp.includes('ago')) return timestamp
-    return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    if (typeof timestamp === 'string' && timestamp.includes('ago')) return timestamp
+    try {
+      return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    } catch {
+      return ''
+    }
   }
 
   if (!walletConnected) {
@@ -118,7 +150,7 @@ export default function MessagingCenter() {
             Connect your Web3 wallet to start secure, encrypted messaging with domain traders.
           </p>
           <button
-            onClick={() => setWalletConnected(true)}
+            onClick={connectWallet}
             className="bg-primary text-primary-foreground px-6 py-3 rounded-lg font-medium hover:bg-primary/90 transition-colors"
           >
             Connect Wallet
@@ -253,43 +285,39 @@ export default function MessagingCenter() {
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {messages.map((message) => (
-                <div
-                  key={message.id}
-                  className={`flex ${
-                    message.sender === '0x1234...5678' ? 'justify-end' : 'justify-start'
-                  }`}
-                >
-                  <div
-                    className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
-                      message.sender === '0x1234...5678'
-                        ? 'bg-primary text-primary-foreground'
-                        : 'bg-accent text-accent-foreground'
-                    }`}
-                  >
-                    <div className="text-sm">{message.content}</div>
-                    <div className={`text-xs mt-1 ${
-                      message.sender === '0x1234...5678'
-                        ? 'text-primary-foreground/70'
-                        : 'text-muted-foreground'
-                    }`}>
-                      {formatTime(message.timestamp)}
-                    </div>
-                    
-                    {message.message_type === 'offer' && message.offer_details && (
-                      <div className="mt-2 p-2 bg-background/10 rounded border">
-                        <div className="text-xs font-medium">Offer Details</div>
-                        <div className="text-sm">
-                          Amount: ${message.offer_details.amount.toLocaleString()} {message.offer_details.currency}
-                        </div>
-                        <div className="text-xs">
-                          Deadline: {new Date(message.offer_details.deadline).toLocaleDateString()}
-                        </div>
+              {messages.map((message) => {
+                const isMine =
+                  myAddress &&
+                  message.sender &&
+                  String(message.sender).toLowerCase() === String(myAddress).toLowerCase()
+                return (
+                  <div key={message.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
+                    <div
+                      className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
+                        isMine ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground'
+                      }`}
+                    >
+                      <div className="text-sm">{message.content}</div>
+                      <div className={`text-xs mt-1 ${isMine ? 'text-primary-foreground/70' : 'text-muted-foreground'}`}>
+                        {formatTime(message.timestamp)}
                       </div>
-                    )}
+
+                      {message.message_type === 'offer' && message.offer_details && (
+                        <div className="mt-2 p-2 bg-background/10 rounded border">
+                          <div className="text-xs font-medium">Offer Details</div>
+                          <div className="text-sm">
+                            Amount: ${message.offer_details.amount?.toLocaleString?.() || message.offer_details.amount}{' '}
+                            {message.offer_details.currency}
+                          </div>
+                          <div className="text-xs">
+                            Deadline: {new Date(message.offer_details.deadline).toLocaleDateString()}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
               <div ref={messagesEndRef} />
             </div>
 
